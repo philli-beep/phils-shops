@@ -1,9 +1,9 @@
 // Kern des Backends: reine Logik ohne Netlify-Abhängigkeit (testbar).
 import { createHmac, timingSafeEqual } from "node:crypto";
 
-const PUBLIC_READ = new Set(["done", "shop", "mapedit", "ostatus"]);
-const OWN_READ = new Set(["routes", "ratings", "orders", "notify"]);
-const PLAYER_WRITE = new Set(["routes", "ratings", "orders"]);
+const PUBLIC_READ = new Set(["done", "shop", "mapedit", "ostatus", "chat"]);
+const OWN_READ = new Set(["routes", "ratings", "orders", "notify", "dm", "dmr"]);
+const PLAYER_WRITE = new Set(["routes", "ratings", "orders", "chat", "dm"]);
 const ALL = new Set([...PUBLIC_READ, ...OWN_READ]);
 const TOKEN_TTL = 12 * 3600 * 1000;
 const MAX_BODY = 400 * 1024;
@@ -54,6 +54,24 @@ function cleanPlayerDoc(col, d) {
       list.push({ id: o.id, ign: o.ign, farm: o.farm, at: o.at, meet: !!o.meet, where: str(o.where, 120) ? o.where : "" });
     }
     return { list };
+  }
+  if (col === "chat") {
+    if (!Array.isArray(d.msgs) || d.msgs.length > 30) return null;
+    const msgs = [];
+    for (const m of d.msgs) {
+      if (!m || !str(m.id, 40) || !str(m.t, 200) || !m.t.trim() || !NAME.test(m.n || "") || !Number.isFinite(m.at)) return null;
+      msgs.push({ id: m.id, n: m.n, t: m.t, at: m.at });
+    }
+    return { msgs };
+  }
+  if (col === "dm") {
+    if (!Array.isArray(d.msgs) || d.msgs.length > 40 || !NAME.test(d.n || "")) return null;
+    const msgs = [];
+    for (const m of d.msgs) {
+      if (!m || !str(m.id, 40) || !str(m.t, 200) || !m.t.trim() || !Number.isFinite(m.at)) return null;
+      msgs.push({ id: m.id, t: m.t, at: m.at });
+    }
+    return { n: d.n, msgs };
   }
   if (col === "routes") {
     if (!Array.isArray(d.subs) || d.subs.length > 40) return null;
@@ -108,7 +126,36 @@ export async function handle(req, store, env) {
       if (req.method === "DELETE") { await store.del(key); return res(200, { ok: true }); }
       if ((req.body || "").length > MAX_BODY) return res(413, { error: "zu groß" });
       let d; try { d = JSON.parse(req.body || "null"); } catch { return res(400, { error: "json" }); }
-      if (!admin) { d = cleanPlayerDoc(p.col, d); if (!d) return res(400, { error: "ungültig" }); }
+      if (!admin) {
+        const sh = (await store.get("shop/status")) || {};
+        if (p.col === "orders" && !sh.open) return res(403, { error: "XP Shop geschlossen" });
+        if (p.col === "chat" && sh.chat === false) return res(403, { error: "Chat ist aus" });
+        if (p.col === "routes" && !sh.cb) return res(403, { error: "Cushion Weg bauen geschlossen" });
+        d = cleanPlayerDoc(p.col, d); if (!d) return res(400, { error: "ungültig" });
+        const nk = (n) => String(n || "").toLowerCase().replace(/[^a-z0-9_]/g, "");
+        const blocked = (ign, kind) => { const b = sh.blocks && sh.blocks[nk(ign)]; const u = b && b[kind]; return !!u && (u === -1 || u > Date.now()); };
+        if (p.col === "orders" && d.list.length) {
+          const last = d.list[d.list.length - 1];
+          const prev = (await store.get(key)) || { list: [] };
+          const isNew = !(prev.list || []).some((o) => o.id === last.id);
+          if (isNew) {
+            if (blocked(last.ign, "o")) return res(403, { error: "gesperrt" });
+            const os = (await store.get("ostatus/" + nk(last.ign))) || { orders: [] };
+            const active = d.list.filter((o) => nk(o.ign) === nk(last.ign)).filter((o) => { const s = (os.orders || []).find((x) => x.id === o.id); const st = s ? s.state : "bearb"; return st !== "fertig" && st !== "no"; });
+            const mx = Number.isInteger(sh.maxord) && sh.maxord >= 1 ? sh.maxord : 2;
+            if (active.length > mx) return res(403, { error: "zu viele offene Bestellungen" });
+          }
+        }
+        if (p.col === "chat" && d.msgs.length) {
+          const prev = (await store.get(key)) || { msgs: [] };
+          const last = d.msgs[d.msgs.length - 1];
+          if (!(prev.msgs || []).some((x) => x.id === last.id) && blocked(last.n, "c")) return res(403, { error: "stumm" });
+        }
+        if (p.col === "routes" && d.subs.length) {
+          const prev = (await store.get(key)) || { subs: [] };
+          if (d.subs.length > (prev.subs || []).length && blocked(d.subs[d.subs.length - 1].ign, "r")) return res(403, { error: "gesperrt" });
+        }
+      }
       else if (!d || typeof d !== "object" || Array.isArray(d)) return res(400, { error: "ungültig" });
       await store.set(key, d);
       return res(200, { ok: true });
